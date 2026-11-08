@@ -67,6 +67,8 @@ HSV293S and the Ajazz AKP153 only report presses; there a press is sent as
 
 ### From the Deck editor
 
+<img src="screenshots/deck-plugins.png" alt="Deck editor Plugins tab with two installed plugins" width="320">
+
 1. Make sure the desktop agent is running (see
    [Nexus desktop launch](nexus-desktop-launch.md)). The **Plugins** tab
    shows whether it is connected.
@@ -126,6 +128,8 @@ only plugins you trust, preferably open-source ones.
 3. Pick the plugin action and click **Save & Apply**.
 
 ## Plugin settings
+
+<img src="screenshots/deck-plugin-settings.png" alt="Plugin settings panel for a weather plugin action" width="280">
 
 Many plugins have their own settings page (Stream Deck calls it a property
 inspector), for example to pick a city or sign in to a service. To open it:
