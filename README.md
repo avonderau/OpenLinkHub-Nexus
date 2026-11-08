@@ -15,6 +15,29 @@
 
 For setup and feature details, see the [Nexus development notes](docs/nexus-fork.md), [Deck plugins (experimental)](docs/deck-plugins.md), [Deck metric guide](docs/deck-live-metrics.md), and [Deck action guide](docs/deck-actions.md).
 
+## Screenshots
+
+**Nexus touchscreen editor:** arrange widgets on the 640 × 48 screen, style them (fill, gradient, corner radius, opacity), and pick icons from built-in glyphs or an installed icon pack with the paged picker.
+
+![Nexus touchscreen editor with a touch button selected and the icon pack picker open](docs/screenshots/nexus-editor.png)
+
+**Deck editor (Mirabox shown):** media, folder, launch and keyboard keys, plus live metric keys with a per-key visualization and color. The right-hand column of this model is display-only LCDs.
+
+![Deck editor for a 15-key Mirabox with live CPU, GPU, RAM and network metric keys](docs/screenshots/deck-editor.png)
+
+**Icon pack library (Settings → Icon Packs):** import, browse, rename and delete icon packs shared by both editors.
+
+![Settings Icon Packs tab showing an imported pack of 35 icons](docs/screenshots/icon-packs.png)
+
+**Deck plugins (experimental):** install OpenDeck/Stream Deck plugins from the Deck editor; they run in your desktop session through the desktop agent. See [Deck plugins](docs/deck-plugins.md).
+
+<p>
+  <img src="docs/screenshots/deck-plugins.png" alt="Deck editor Plugins tab with two installed plugins" width="320">
+  <img src="docs/screenshots/deck-plugin-settings.png" alt="Plugin settings panel for a weather plugin action" width="280">
+</p>
+
+<sub>Editor screenshots were captured from this fork's WebUI with sample layouts and readings.</sub>
+
 **Development status:** The features described here refer to the repository's development code; published release assets may lag behind `main`. Nexus and Deck customization remains under active development, and physical-device actions and desktop integration should be tested on real hardware. For **Open URL** and **Launch Application** buttons when OpenLinkHub runs as a background service, see the [local Nexus desktop agent setup](docs/nexus-desktop-launch.md). These buttons open on the computer hosting OpenLinkHub, not on a separate WebUI client. Do not assume all upstream installation packages include these features.
 
 See [Nexus development notes](docs/nexus-fork.md) for details and limitations.
@@ -94,7 +117,7 @@ Manage RGB lighting, fan speeds, system metrics, as well as keyboards, mice, and
 - [OpenRGB Integration](openrgb/README.md)
 - [XENEON EDGE KDE](docs/xeneon-edge-kde.md)
 
-![Web UI](https://github.com/jurkovic-nikola/OpenLinkHub/blob/main/static/img/ui.png?raw=true)
+See [Screenshots](#screenshots) for this fork's WebUI.
 
 ## Info
 - This project was created out of necessity to control fans and pumps on workstations after switching everything to Linux.
