@@ -76,6 +76,7 @@ jobs:
           name: nexus-native-packages
           path: packages/*
           if-no-files-found: error
+          retention-days: 3
       - name: Attach DEB and RPM to existing GitHub release
         if: github.repository == 'avonderau/OpenLinkHub-Nexus' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         shell: bash
