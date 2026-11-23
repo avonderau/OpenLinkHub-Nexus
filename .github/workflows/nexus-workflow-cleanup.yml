@@ -89,85 +89,153 @@ jobs:
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Select workflow runs
+      # GitHub's run listing returns at most 1,000 runs per query, however
+      # many pages are asked for. So this step works in passes: list up to
+      # 1,000 candidate runs, delete the ones that match, then list again,
+      # until a pass finds nothing left to delete.
+      - name: Delete workflow runs
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           gh api --paginate "repos/$REPO/actions/workflows?per_page=100" \
             --jq '.workflows[] | {id, name, path, file: (.path | split("/") | last)}' \
             | jq -s . > workflows.json
-          gh api --paginate "repos/$REPO/actions/runs?per_page=100&status=completed" \
-            --jq '.workflow_runs[] | {id, workflow_id, name, path, conclusion, created_at, event, head_branch}' \
-            | jq -s . > runs.json
-          echo "Found $(jq length runs.json) completed runs across $(jq length workflows.json) workflows"
 
           # A workflow is orphaned when its file is gone from the default branch.
-          git_tree=$(gh api "repos/$REPO/git/trees/${{ github.event.repository.default_branch }}?recursive=1" \
-            --jq '[.tree[].path | select(startswith(".github/workflows/"))]')
+          gh api "repos/$REPO/git/trees/$DEFAULT_BRANCH?recursive=1" \
+            --jq '[.tree[].path | select(startswith(".github/workflows/"))]' > tree.json
+          jq --slurpfile tree tree.json \
+            '[.[] | .path as $p | select(($p | startswith(".github/workflows/")) and ($tree[0] | any(.[]; . == $p) | not))]' \
+            workflows.json > orphans.json
+          echo "Orphaned workflows: $(jq -r 'map(.file) | join(", ")' orphans.json)"
 
-          jq -r \
-            --argjson workflows "$(cat workflows.json)" \
-            --argjson tree "$git_tree" \
-            --arg cutoff "$CUTOFF" \
-            --arg keepDays "$KEEP_DAYS" \
-            --argjson keepLatest "$KEEP_LATEST" \
-            --arg conclusion "$CONCLUSION" \
-            --arg workflow "$WORKFLOW" \
-            --arg orphaned "$ORPHANED" \
-            --arg current "$CURRENT_RUN" '
-            ($workflows | map({(.id | tostring): .}) | add // {}) as $byId
-            | def wf: $byId[(.workflow_id | tostring)];
-              def is_orphan: ((.path // "") as $p | ($p | startswith(".github/workflows/")) and (($tree | index($p)) == null));
-              def matches_workflow:
-                $workflow == "" or (wf.file // "") == $workflow or (wf.name // .name) == $workflow or (.path // "") == $workflow;
-              def matches_conclusion:
-                if $conclusion == "any" then true
-                elif $conclusion == "failure-or-cancelled" then (.conclusion == "failure" or .conclusion == "cancelled")
-                else .conclusion == $conclusion end;
-            map(select((.id | tostring) != $current))
-            | group_by(.workflow_id)
-            | map(
-                sort_by(.created_at) | reverse
-                | if ($orphaned == "true" and (.[0] | is_orphan)) then
-                    map(select(matches_workflow) + {reason: "orphaned"})
-                  else
-                    .[$keepLatest:]
-                    | map(select(matches_workflow and matches_conclusion
-                                 and ($keepDays == "0" or .created_at < $cutoff))
-                          + {reason: "old"})
-                  end)
-            | flatten
-            | .[]
-            | [.id, .created_at, (.conclusion // "-"), .reason, (wf.file // .path // .name)] | @tsv
-          ' runs.json > delete-runs.tsv
+          # The newest keep_latest completed runs of each workflow are never
+          # deleted, so collect their ids once up front.
+          : > keep.txt
+          if [ "$KEEP_LATEST" -gt 0 ]; then
+            for id in $(jq -r '.[].id' workflows.json); do
+              gh api "repos/$REPO/actions/workflows/$id/runs?status=completed&per_page=$KEEP_LATEST" \
+                --jq '.workflow_runs[].id' >> keep.txt
+            done
+          fi
+          jq -R -s 'split("\n") | map(select(. != ""))' keep.txt > keep.json
 
-          count=$(wc -l < delete-runs.tsv)
-          echo "RUN_COUNT=$count" >> "$GITHUB_ENV"
+          # Narrow the listing itself as far as the API allows, so each
+          # 1,000-run page is made of runs that can actually be deleted.
+          case "$CONCLUSION" in
+            any) statuses="completed" ;;
+            failure-or-cancelled) statuses="failure cancelled" ;;
+            *) statuses="$CONCLUSION" ;;
+          esac
+          created=""
+          if [ "$KEEP_DAYS" != "0" ]; then created="&created=%3C$CUTOFF"; fi
+          runs_path="repos/$REPO/actions/runs"
+          if [ -n "$WORKFLOW" ]; then
+            wid=$(jq -r --arg w "$WORKFLOW" 'map(select(.file == $w or .name == $w or .path == $w)) | .[0].id // empty' workflows.json)
+            if [ -z "$wid" ]; then
+              echo "::error::No workflow matches '$WORKFLOW'"
+              exit 1
+            fi
+            runs_path="repos/$REPO/actions/workflows/$wid/runs"
+          fi
+
+          list_candidates() {
+            {
+              for st in $statuses; do
+                gh api --paginate "$runs_path?per_page=100&status=$st$created" \
+                  --jq '.workflow_runs[] | {id, workflow_id, path, conclusion, created_at, orphan: false}'
+              done
+              if [ "$ORPHANED" = "true" ]; then
+                for id in $(jq -r '.[].id' orphans.json); do
+                  gh api --paginate "repos/$REPO/actions/workflows/$id/runs?per_page=100&status=completed" \
+                    --jq '.workflow_runs[] | {id, workflow_id, path, conclusion, created_at, orphan: true}'
+                done
+              fi
+            } | jq -s 'unique_by(.id)' > candidates.json
+          }
+
+          select_runs() {
+            jq -r \
+              --slurpfile workflows workflows.json \
+              --slurpfile keep keep.json \
+              --slurpfile orphans orphans.json \
+              --arg conclusion "$CONCLUSION" \
+              --arg workflow "$WORKFLOW" \
+              --arg current "$CURRENT_RUN" '
+              ($workflows[0] | map({(.id | tostring): .}) | add // {}) as $byId
+              | ($orphans[0] | map(.id)) as $orphanIds
+              | def wf: $byId[(.workflow_id | tostring)];
+                def matches_workflow:
+                  $workflow == "" or (wf.file // "") == $workflow or (wf.name // "") == $workflow or (.path // "") == $workflow;
+                def matches_conclusion:
+                  if $conclusion == "any" then true
+                  elif $conclusion == "failure-or-cancelled" then (.conclusion == "failure" or .conclusion == "cancelled")
+                  else .conclusion == $conclusion end;
+              .[]
+              | select((.id | tostring) != $current and matches_workflow)
+              | .workflow_id as $wid | (.id | tostring) as $rid
+              | ($orphanIds | any(.[]; . == $wid)) as $isOrphan
+              | if $isOrphan then . + {reason: "orphaned"}
+                elif .orphan then empty
+                elif ($keep[0] | any(.[]; . == $rid) | not) and matches_conclusion then . + {reason: "old"}
+                else empty end
+              | [.id, .created_at, (.conclusion // "-"), .reason, (wf.file // .path // "?")] | @tsv
+            ' candidates.json
+          }
+
+          total=$(gh api "$runs_path?per_page=1&status=${statuses%% *}$created" --jq .total_count)
+          # GitHub stops counting search totals at 2,500.
+          if [ "$total" -ge 2500 ]; then total="2,500 or more"; fi
+          echo "GitHub counts $total matching runs older than the cutoff"
+
+          deleted=0 failed=0 pass=0
+          : > all-selected.tsv
+          while [ "$pass" -lt 50 ]; do
+            pass=$((pass + 1))
+            list_candidates
+            select_runs > delete-runs.tsv
+            count=$(wc -l < delete-runs.tsv)
+            echo "Pass $pass: $(jq length candidates.json) listed, $count selected"
+            [ "$count" -eq 0 ] && break
+            cat delete-runs.tsv >> all-selected.tsv
+            if [ "$DRY_RUN" = "true" ]; then break; fi
+            pass_deleted=0
+            while IFS=$'\t' read -r id created conclusion reason wf; do
+              if gh api -X DELETE "repos/$REPO/actions/runs/$id" --silent; then
+                pass_deleted=$((pass_deleted + 1))
+              else
+                echo "::warning::Could not delete run $id ($wf)"
+                failed=$((failed + 1))
+              fi
+            done < delete-runs.tsv
+            deleted=$((deleted + pass_deleted))
+            echo "Pass $pass: deleted $pass_deleted"
+            # Stop rather than spin if nothing in this pass could be deleted.
+            [ "$pass_deleted" -eq 0 ] && break
+          done
+
+          selected=$(wc -l < all-selected.tsv)
           {
-            echo "### Runs selected: $count"
-            echo
-            if [ "$count" -gt 0 ]; then
-              echo "| Workflow | Runs |"
-              echo "| --- | --- |"
-              cut -f5 delete-runs.tsv | sort | uniq -c | sort -rn | awk '{c=$1; $1=""; sub(/^ /,""); printf "| %s | %s |\n", $0, c}'
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "### Runs selected: $selected"
+              echo
+              if [ "$(jq length candidates.json)" -ge 1000 ]; then
+                echo "GitHub lists at most 1,000 runs at a time, and it counts $total matching runs, so a real run will find more than this. It keeps going in passes until nothing matches."
+                echo
+              fi
+            else
+              echo "### Deleted $deleted runs in $pass passes ($failed failed)"
               echo
             fi
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "id	created	conclusion	reason	workflow"
-          cat delete-runs.tsv
-
-      - name: Delete workflow runs
-        if: inputs.dry_run == false && env.RUN_COUNT != '0'
-        run: |
-          deleted=0 failed=0
-          while IFS=$'\t' read -r id created conclusion reason wf; do
-            if gh api -X DELETE "repos/$REPO/actions/runs/$id" --silent; then
-              deleted=$((deleted + 1))
-            else
-              echo "::warning::Could not delete run $id ($wf)"
-              failed=$((failed + 1))
+            if [ "$selected" -gt 0 ]; then
+              echo "| Workflow | Runs |"
+              echo "| --- | --- |"
+              cut -f5 all-selected.tsv | sort | uniq -c | sort -rn | awk '{c=$1; $1=""; sub(/^ /,""); printf "| %s | %s |\n", $0, c}'
+              echo
             fi
-          done < delete-runs.tsv
-          echo "Deleted $deleted runs, $failed failed"
-          echo "Deleted **$deleted** runs ($failed failed)." >> "$GITHUB_STEP_SUMMARY"
+            left=$(gh api "repos/$REPO/actions/runs?per_page=1" --jq .total_count)
+            echo "Runs left in the repository: $left. Runs from the last $KEEP_DAYS days and the newest $KEEP_LATEST of each workflow are kept on purpose."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Clean up artifacts
         if: inputs.artifacts
