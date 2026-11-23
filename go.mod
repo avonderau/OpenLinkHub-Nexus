@@ -1,6 +1,6 @@
 module OpenLinkHub
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/godbus/dbus/v5 v5.1.0
