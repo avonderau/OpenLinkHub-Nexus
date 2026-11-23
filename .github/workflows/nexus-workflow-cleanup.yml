@@ -1,0 +1,206 @@
+name: Workflow run cleanup
+# On-demand cleanup of old GitHub Actions data in this fork: workflow runs
+# (with their logs), and optionally artifacts and caches. Run it from the
+# Actions tab with "Run workflow". It defaults to a dry run, which only lists
+# what would be deleted; untick "dry_run" to actually delete.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Only list what would be deleted
+        type: boolean
+        default: true
+      keep_days:
+        description: Delete runs older than this many days (0 = any age)
+        type: number
+        default: 30
+      keep_latest:
+        description: Always keep this many newest runs of each workflow
+        type: number
+        default: 5
+      conclusion:
+        description: Which finished runs to delete
+        type: choice
+        default: any
+        options:
+          - any
+          - failure
+          - cancelled
+          - skipped
+          - failure-or-cancelled
+          - success
+      workflow:
+        description: Only this workflow (file name like go.yml, or its display name); blank = all
+        type: string
+        default: ''
+      orphaned:
+        description: Also delete every run of workflows whose file no longer exists
+        type: boolean
+        default: false
+      artifacts:
+        description: Also delete artifacts older than keep_days
+        type: boolean
+        default: false
+      caches:
+        description: Also delete caches not used in keep_days
+        type: boolean
+        default: false
+permissions:
+  actions: write
+  contents: read
+concurrency:
+  group: workflow-cleanup
+  cancel-in-progress: false
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      KEEP_DAYS: ${{ inputs.keep_days }}
+      KEEP_LATEST: ${{ inputs.keep_latest }}
+      CONCLUSION: ${{ inputs.conclusion }}
+      WORKFLOW: ${{ inputs.workflow }}
+      ORPHANED: ${{ inputs.orphaned }}
+      CURRENT_RUN: ${{ github.run_id }}
+    steps:
+      - name: Check inputs
+        run: |
+          for v in "$KEEP_DAYS" "$KEEP_LATEST"; do
+            if ! [[ "$v" =~ ^[0-9]+$ ]]; then
+              echo "::error::keep_days and keep_latest must be whole numbers (got '$v')"
+              exit 1
+            fi
+          done
+          cutoff=$(date -u -d "$KEEP_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "CUTOFF=$cutoff" >> "$GITHUB_ENV"
+          {
+            echo "## Workflow cleanup"
+            echo
+            echo "| Setting | Value |"
+            echo "| --- | --- |"
+            echo "| Dry run | $DRY_RUN |"
+            echo "| Older than | $KEEP_DAYS days ($cutoff) |"
+            echo "| Keep newest per workflow | $KEEP_LATEST |"
+            echo "| Conclusion | $CONCLUSION |"
+            echo "| Workflow | ${WORKFLOW:-all} |"
+            echo "| Orphaned workflows | $ORPHANED |"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Select workflow runs
+        run: |
+          gh api --paginate "repos/$REPO/actions/workflows?per_page=100" \
+            --jq '.workflows[] | {id, name, path, file: (.path | split("/") | last)}' \
+            | jq -s . > workflows.json
+          gh api --paginate "repos/$REPO/actions/runs?per_page=100&status=completed" \
+            --jq '.workflow_runs[] | {id, workflow_id, name, path, conclusion, created_at, event, head_branch}' \
+            | jq -s . > runs.json
+          echo "Found $(jq length runs.json) completed runs across $(jq length workflows.json) workflows"
+
+          # A workflow is orphaned when its file is gone from the default branch.
+          git_tree=$(gh api "repos/$REPO/git/trees/${{ github.event.repository.default_branch }}?recursive=1" \
+            --jq '[.tree[].path | select(startswith(".github/workflows/"))]')
+
+          jq -r \
+            --argjson workflows "$(cat workflows.json)" \
+            --argjson tree "$git_tree" \
+            --arg cutoff "$CUTOFF" \
+            --arg keepDays "$KEEP_DAYS" \
+            --argjson keepLatest "$KEEP_LATEST" \
+            --arg conclusion "$CONCLUSION" \
+            --arg workflow "$WORKFLOW" \
+            --arg orphaned "$ORPHANED" \
+            --arg current "$CURRENT_RUN" '
+            ($workflows | map({(.id | tostring): .}) | add // {}) as $byId
+            | def wf: $byId[(.workflow_id | tostring)];
+              def is_orphan: ((.path // "") as $p | ($p | startswith(".github/workflows/")) and (($tree | index($p)) == null));
+              def matches_workflow:
+                $workflow == "" or (wf.file // "") == $workflow or (wf.name // .name) == $workflow or (.path // "") == $workflow;
+              def matches_conclusion:
+                if $conclusion == "any" then true
+                elif $conclusion == "failure-or-cancelled" then (.conclusion == "failure" or .conclusion == "cancelled")
+                else .conclusion == $conclusion end;
+            map(select((.id | tostring) != $current))
+            | group_by(.workflow_id)
+            | map(
+                sort_by(.created_at) | reverse
+                | if ($orphaned == "true" and (.[0] | is_orphan)) then
+                    map(select(matches_workflow) + {reason: "orphaned"})
+                  else
+                    .[$keepLatest:]
+                    | map(select(matches_workflow and matches_conclusion
+                                 and ($keepDays == "0" or .created_at < $cutoff))
+                          + {reason: "old"})
+                  end)
+            | flatten
+            | .[]
+            | [.id, .created_at, (.conclusion // "-"), .reason, (wf.file // .path // .name)] | @tsv
+          ' runs.json > delete-runs.tsv
+
+          count=$(wc -l < delete-runs.tsv)
+          echo "RUN_COUNT=$count" >> "$GITHUB_ENV"
+          {
+            echo "### Runs selected: $count"
+            echo
+            if [ "$count" -gt 0 ]; then
+              echo "| Workflow | Runs |"
+              echo "| --- | --- |"
+              cut -f5 delete-runs.tsv | sort | uniq -c | sort -rn | awk '{c=$1; $1=""; sub(/^ /,""); printf "| %s | %s |\n", $0, c}'
+              echo
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "id	created	conclusion	reason	workflow"
+          cat delete-runs.tsv
+
+      - name: Delete workflow runs
+        if: inputs.dry_run == false && env.RUN_COUNT != '0'
+        run: |
+          deleted=0 failed=0
+          while IFS=$'\t' read -r id created conclusion reason wf; do
+            if gh api -X DELETE "repos/$REPO/actions/runs/$id" --silent; then
+              deleted=$((deleted + 1))
+            else
+              echo "::warning::Could not delete run $id ($wf)"
+              failed=$((failed + 1))
+            fi
+          done < delete-runs.tsv
+          echo "Deleted $deleted runs, $failed failed"
+          echo "Deleted **$deleted** runs ($failed failed)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up artifacts
+        if: inputs.artifacts
+        run: |
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.expired == false and .created_at < \"$CUTOFF\") | [.id, .name, .size_in_bytes, .created_at] | @tsv" \
+            > artifacts.tsv
+          count=$(wc -l < artifacts.tsv)
+          mb=$(awk -F'\t' '{s+=$3} END {printf "%.1f", s/1048576}' artifacts.tsv)
+          echo "### Artifacts selected: $count ($mb MB)" >> "$GITHUB_STEP_SUMMARY"
+          cat artifacts.tsv
+          if [ "$DRY_RUN" = "true" ]; then exit 0; fi
+          while IFS=$'\t' read -r id name size created; do
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" --silent \
+              || echo "::warning::Could not delete artifact $id ($name)"
+          done < artifacts.tsv
+
+      - name: Clean up caches
+        if: inputs.caches
+        run: |
+          gh api --paginate "repos/$REPO/actions/caches?per_page=100" \
+            --jq ".actions_caches[] | select(.last_accessed_at < \"$CUTOFF\") | [.id, .key, .size_in_bytes, .last_accessed_at] | @tsv" \
+            > caches.tsv
+          count=$(wc -l < caches.tsv)
+          mb=$(awk -F'\t' '{s+=$3} END {printf "%.1f", s/1048576}' caches.tsv)
+          echo "### Caches selected: $count ($mb MB)" >> "$GITHUB_STEP_SUMMARY"
+          cat caches.tsv
+          if [ "$DRY_RUN" = "true" ]; then exit 0; fi
+          while IFS=$'\t' read -r id key size accessed; do
+            gh api -X DELETE "repos/$REPO/actions/caches/$id" --silent \
+              || echo "::warning::Could not delete cache $id ($key)"
+          done < caches.tsv
+
+      - name: Dry run note
+        if: inputs.dry_run
+        run: echo "Dry run only. Nothing was deleted. Run again with dry_run unticked to delete." >> "$GITHUB_STEP_SUMMARY"
